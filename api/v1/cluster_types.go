@@ -754,6 +754,11 @@ const (
 	// PhaseWaitingForInstancesToBeActive is a waiting phase that is triggered when an instance pod is not active
 	PhaseWaitingForInstancesToBeActive = "Waiting for the instances to become active"
 
+	// PhaseUnschedulable is a transient phase set when a provisioning Job is
+	// blocked by an identified structural cause (e.g. unschedulable Pod or
+	// exhausted ResourceQuota); it clears once the Job makes progress.
+	PhaseUnschedulable = "Provisioning is blocked"
+
 	// PhaseOnlineUpgrading for when the instance manager is being upgraded in place
 	PhaseOnlineUpgrading = "Online upgrade in progress"
 
@@ -1188,6 +1193,15 @@ const (
 	// has had at least one running instance, at which point it is set to True
 	// and never cleared.
 	ConditionInitialized ClusterConditionType = "Initialized"
+	// ConditionProvisioning reflects the health of the in-flight resource
+	// provisioning (bootstrap, join and recovery Jobs). Unlike
+	// ConditionInitialized, which is a monotonic latch on the first successful
+	// bootstrap, this condition oscillates with the current provisioning
+	// attempt: it is True while a Job is making progress, and False (with a
+	// machine-readable reason) when a Job has permanently failed or appears
+	// stuck. It is meaningful across the whole cluster lifecycle, including
+	// scale-up of an already-initialized cluster.
+	ConditionProvisioning ClusterConditionType = "Provisioning"
 )
 
 // ConditionStatus defines conditions of resources
@@ -1244,6 +1258,30 @@ const (
 	// BootstrapPending is the reason set on ConditionInitialized=False while the
 	// cluster has not yet completed its first bootstrap.
 	BootstrapPending ConditionReason = "BootstrapPending"
+
+	// ProvisioningHealthy is set on ConditionProvisioning=True while one or
+	// more provisioning Jobs are running and making progress. The status is
+	// True because nothing is wrong with provisioning; the human-readable
+	// message conveys that a Job is still in progress.
+	ProvisioningHealthy ConditionReason = "ProvisioningHealthy"
+
+	// ProvisioningIdle is set on ConditionProvisioning=True when there are no
+	// incomplete provisioning Jobs to act on (none running, none failed, none
+	// stuck). It signals the absence of an active provisioning task, not the
+	// successful completion of any particular one.
+	ProvisioningIdle ConditionReason = "ProvisioningIdle"
+
+	// ProvisioningJobFailed is set on ConditionProvisioning=False when a
+	// provisioning Job has permanently failed (its Kubernetes JobFailed
+	// condition is True, e.g. the back-off limit was exceeded).
+	ProvisioningJobFailed ConditionReason = "ProvisioningJobFailed"
+
+	// ProvisioningJobStuck is set on ConditionProvisioning=False when a
+	// provisioning Job has not started any Pod within the expected time window,
+	// which typically indicates a structural problem that the operator cannot
+	// resolve on its own (e.g. exhausted ResourceQuota, admission webhook
+	// rejection or unschedulable Pods).
+	ProvisioningJobStuck ConditionReason = "ProvisioningJobStuck"
 )
 
 // EmbeddedObjectMetadata contains metadata to be inherited by all resources related to a Cluster

@@ -26,6 +26,8 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strings"
+	"time"
 
 	"github.com/cloudnative-pg/machinery/pkg/log"
 	pgTime "github.com/cloudnative-pg/machinery/pkg/postgres/time"
@@ -58,25 +60,25 @@ type managedResources struct {
 	jobs      batchv1.JobList
 }
 
-// Count the number of jobs that are still running
-func (resources *managedResources) runningJobNames() []string {
-	result := make([]string, 0, len(resources.jobs.Items))
+// runningJobs returns the Jobs that have not yet reached their requested number
+// of completions, as full objects so callers can diagnose them.
+func (resources *managedResources) runningJobs() []batchv1.Job {
+	result := make([]batchv1.Job, 0, len(resources.jobs.Items))
 	for _, job := range resources.jobs.Items {
 		if !utils.JobHasOneCompletion(job) {
-			result = append(result, job.Name)
+			result = append(result, job)
 		}
 	}
 	return result
 }
 
-// failedJobNames returns the names of the jobs that have permanently failed,
-// i.e. they have exhausted their backoff limit
-func (resources *managedResources) failedJobNames() []string {
-	result := make([]string, 0, len(resources.jobs.Items))
-	for _, job := range resources.jobs.Items {
-		if utils.JobHasFailed(job) {
-			result = append(result, job.Name)
-		}
+// runningJobNames returns the names of the jobs that are still running. It is a
+// convenience wrapper around runningJobs for logging.
+func (resources *managedResources) runningJobNames() []string {
+	running := resources.runningJobs()
+	result := make([]string, 0, len(running))
+	for i := range running {
+		result = append(result, running[i].Name)
 	}
 	return result
 }
@@ -742,6 +744,216 @@ func (r *ClusterReconciler) RegisterPhase(ctx context.Context,
 		status.SetPhase(phase, reason),
 		status.SetClusterReadyCondition,
 	)
+}
+
+// reconcileProvisioningCondition reflects the health of the in-flight Jobs on
+// the cluster's Provisioning condition. Unlike Initialized (a latch on first
+// bootstrap), it oscillates with the current attempt and covers any
+// provisioning Job, including scale-up of an already-initialized cluster.
+//
+// Failed Jobs are handled separately by the caller; this only distinguishes
+// stuck from healthy. It returns the concrete root cause of a stuck Job when one
+// could be identified, so the caller can also surface it on the phase.
+func (r *ClusterReconciler) reconcileProvisioningCondition(
+	ctx context.Context,
+	cluster *apiv1.Cluster,
+	runningJobs []batchv1.Job,
+) (stuckRootCause string, err error) {
+	contextLogger := log.FromContext(ctx)
+
+	// Best-effort: on error we fall back to the Job-only signals.
+	jobPods := r.getJobsPods(ctx, cluster, runningJobs)
+
+	diagnosis := utils.DiagnoseJobs(runningJobs, jobPods, time.Now(), utils.DefaultJobStuckThreshold)
+
+	conditionStatus := metav1.ConditionTrue
+	reason := apiv1.ProvisioningHealthy
+	message := "Provisioning is in progress"
+
+	if len(diagnosis.Stuck) > 0 {
+		conditionStatus = metav1.ConditionFalse
+		reason = apiv1.ProvisioningJobStuck
+		message = fmt.Sprintf(
+			"Provisioning job made no progress and may be blocked "+
+				"(check ResourceQuota, admission webhooks and Pod scheduling): %s",
+			strings.Join(jobNames(diagnosis.Stuck), ", "))
+		stuckRootCause = r.probeJobsRootCause(ctx, diagnosis.Stuck, jobPods)
+		if stuckRootCause != "" {
+			message = fmt.Sprintf("%s. Latest blocker reported by Kubernetes: %s", message, stuckRootCause)
+		}
+		contextLogger.Warning("Detected stuck provisioning job",
+			"jobs", jobNames(diagnosis.Stuck))
+		r.Recorder.Event(cluster, "Warning", "ProvisioningJobStuck", message)
+	}
+
+	return stuckRootCause, r.patchProvisioningConditionIfChanged(ctx, cluster, conditionStatus, reason, message)
+}
+
+// setProvisioningFailedCondition sets the Provisioning condition to
+// False/ProvisioningJobFailed for the given permanently failed Jobs, enriching
+// the message with the concrete root cause when Kubernetes reported one.
+func (r *ClusterReconciler) setProvisioningFailedCondition(
+	ctx context.Context,
+	cluster *apiv1.Cluster,
+	failedJobs []batchv1.Job,
+) error {
+	jobPods := r.getJobsPods(ctx, cluster, failedJobs)
+	message := fmt.Sprintf("Provisioning job failed: %s", strings.Join(jobNames(failedJobs), ", "))
+	message = r.appendJobRootCause(ctx, message, failedJobs, jobPods)
+	r.Recorder.Event(cluster, "Warning", "ProvisioningJobFailed", message)
+	return r.patchProvisioningConditionIfChanged(
+		ctx, cluster, metav1.ConditionFalse, apiv1.ProvisioningJobFailed, message)
+}
+
+// appendJobRootCause appends the concrete Kubernetes-reported blocker to message
+// when one is found, returning message unchanged otherwise.
+func (r *ClusterReconciler) appendJobRootCause(
+	ctx context.Context,
+	message string,
+	jobs []batchv1.Job,
+	jobPods []corev1.Pod,
+) string {
+	detail := r.probeJobsRootCause(ctx, jobs, jobPods)
+	if detail == "" {
+		return message
+	}
+	return fmt.Sprintf("%s. Latest blocker reported by Kubernetes: %s", message, detail)
+}
+
+// probeJobsRootCause returns the concrete blocker behind the offending Jobs, or
+// "" when none is found. A live unschedulable Pod (scheduler cannot place it)
+// takes precedence over a FailedCreate event (Pod never created: quota,
+// admission, LimitRange), since the two are mutually exclusive. Best-effort:
+// listing errors are logged and swallowed.
+func (r *ClusterReconciler) probeJobsRootCause(ctx context.Context, jobs []batchv1.Job, jobPods []corev1.Pod) string {
+	contextLogger := log.FromContext(ctx)
+
+	for i := range jobs {
+		if reason := utils.UnschedulablePodReason(utils.PodsControlledByJob(&jobs[i], jobPods)); reason != "" {
+			return reason
+		}
+	}
+
+	var best utils.FailedCreateEvent
+	for i := range jobs {
+		events, err := r.getJobEvents(ctx, &jobs[i])
+		if err != nil {
+			contextLogger.Debug("Could not list events while probing stuck/failed job root cause",
+				"job", jobs[i].Name, "error", err.Error())
+			continue
+		}
+
+		// Keep the most recent blocker across all offending Jobs.
+		candidate := utils.MostRecentFailedCreateEvent(events)
+		if candidate.Message == "" {
+			continue
+		}
+		if best.Message == "" || !candidate.When.Before(best.When) {
+			best = candidate
+		}
+	}
+	return best.Message
+}
+
+// getJobsPods returns the cluster Pods controlled by any of the supplied Jobs.
+// Best-effort: listing errors are logged and swallowed.
+func (r *ClusterReconciler) getJobsPods(
+	ctx context.Context,
+	cluster *apiv1.Cluster,
+	jobs []batchv1.Job,
+) []corev1.Pod {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels{utils.ClusterLabelName: cluster.Name},
+	); err != nil {
+		log.FromContext(ctx).Debug("Could not list pods while probing provisioning jobs",
+			"error", err.Error())
+		return nil
+	}
+
+	var result []corev1.Pod
+	for i := range jobs {
+		result = append(result, utils.PodsControlledByJob(&jobs[i], pods.Items)...)
+	}
+	return result
+}
+
+// getJobEvents returns the Events involving the given Job, filtered in memory by
+// UID (falling back to name) so it behaves the same with the cache, a real
+// client and the test fake client.
+func (r *ClusterReconciler) getJobEvents(ctx context.Context, job *batchv1.Job) ([]corev1.Event, error) {
+	var events corev1.EventList
+	if err := r.List(ctx, &events, client.InNamespace(job.Namespace)); err != nil {
+		return nil, err
+	}
+
+	result := make([]corev1.Event, 0, len(events.Items))
+	for i := range events.Items {
+		ref := events.Items[i].InvolvedObject
+		if ref.Kind != "Job" {
+			continue
+		}
+		if (job.UID != "" && ref.UID == job.UID) || ref.Name == job.Name {
+			result = append(result, events.Items[i])
+		}
+	}
+	return result, nil
+}
+
+// clearProvisioningCondition sets the Provisioning condition to True/Idle when no
+// Job is in flight. It is a no-op when the condition is absent, so we never
+// create it just to mark a cluster that never had a problem.
+func (r *ClusterReconciler) clearProvisioningCondition(
+	ctx context.Context,
+	cluster *apiv1.Cluster,
+) error {
+	if meta.FindStatusCondition(cluster.Status.Conditions, string(apiv1.ConditionProvisioning)) == nil {
+		return nil
+	}
+
+	return r.patchProvisioningConditionIfChanged(
+		ctx,
+		cluster,
+		metav1.ConditionTrue,
+		apiv1.ProvisioningIdle,
+		"No provisioning in progress",
+	)
+}
+
+// patchProvisioningConditionIfChanged patches the Provisioning condition only
+// when the desired tuple differs, keeping lastTransitionTime stable across the
+// 5s requeues.
+func (r *ClusterReconciler) patchProvisioningConditionIfChanged(
+	ctx context.Context,
+	cluster *apiv1.Cluster,
+	conditionStatus metav1.ConditionStatus,
+	reason apiv1.ConditionReason,
+	message string,
+) error {
+	existing := meta.FindStatusCondition(cluster.Status.Conditions, string(apiv1.ConditionProvisioning))
+	if existing != nil &&
+		existing.Status == conditionStatus &&
+		existing.Reason == string(reason) &&
+		existing.Message == message {
+		return nil
+	}
+
+	return status.PatchWithOptimisticLock(
+		ctx,
+		r.Client,
+		cluster,
+		status.SetProvisioningCondition(conditionStatus, reason, message),
+	)
+}
+
+// jobNames extracts the names from a slice of Jobs, for human-readable messages.
+func jobNames(jobs []batchv1.Job) []string {
+	names := make([]string, len(jobs))
+	for i := range jobs {
+		names[i] = jobs[i].Name
+	}
+	return names
 }
 
 // updateClusterStatusThatRequiresInstancesState updates all the cluster status fields that require the instances status

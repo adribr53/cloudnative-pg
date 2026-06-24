@@ -78,4 +78,15 @@ var _ = Describe("Job conditions", func() {
 				},
 			}}, false),
 	)
+
+	It("filters out the failed jobs from a list", func() {
+		failed := batchv1.Job{Status: batchv1.JobStatus{
+			Conditions: []batchv1.JobCondition{
+				{Type: batchv1.JobFailed, Status: corev1.ConditionTrue},
+			},
+		}}
+		Expect(FilterFailedJobs([]batchv1.Job{nonCompleteJob, failed, completeJob})).
+			To(ConsistOf(failed))
+		Expect(FilterFailedJobs([]batchv1.Job{nonCompleteJob, completeJob})).To(BeEmpty())
+	})
 })

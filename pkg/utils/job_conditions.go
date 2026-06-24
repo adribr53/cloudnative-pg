@@ -48,6 +48,17 @@ func JobHasFailed(job batchv1.Job) bool {
 	return false
 }
 
+// FilterFailedJobs returns the Jobs that have permanently failed.
+func FilterFailedJobs(jobs []batchv1.Job) []batchv1.Job {
+	result := make([]batchv1.Job, 0, len(jobs))
+	for _, job := range jobs {
+		if JobHasFailed(job) {
+			result = append(result, job)
+		}
+	}
+	return result
+}
+
 // FilterJobsWithOneCompletion returns jobs that have one completion
 func FilterJobsWithOneCompletion(jobList []batchv1.Job) []batchv1.Job {
 	var result []batchv1.Job

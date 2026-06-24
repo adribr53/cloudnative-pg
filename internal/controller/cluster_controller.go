@@ -151,7 +151,7 @@ var ErrNextLoop = utils.ErrNextLoop
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=create;patch;update;get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;watch;delete;patch
 // +kubebuilder:rbac:groups="",resources=configmaps/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups="",resources=events,verbs=create
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;create;watch;delete;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;delete;patch;create;watch
@@ -873,17 +873,24 @@ func (r *ClusterReconciler) reconcileResources(
 		return *result, err
 	}
 
+	runningJobs := resources.runningJobs()
+
 	// A Job that creates an instance (bootstrap, recovery or replica creation)
 	// is counted as "running" until it succeeds, so a Job that has exhausted its
 	// backoff limit would otherwise keep the cluster waiting forever. Surface the
 	// failure in the phase instead. The cause is in the job logs and has to be
 	// investigated: there is no predefined recipe.
-	if failedJobs := resources.failedJobNames(); len(failedJobs) > 0 {
-		contextLogger.Warning("An instance creation job has failed", "failedJobs", failedJobs)
+	if failedJobs := utils.FilterFailedJobs(runningJobs); len(failedJobs) > 0 {
+		contextLogger.Warning("An instance creation job has failed", "failedJobs", jobNames(failedJobs))
+
+		// Also reflect the failure on the machine-readable Provisioning condition.
+		if err := r.setProvisioningFailedCondition(ctx, cluster, failedJobs); err != nil {
+			return ctrl.Result{}, err
+		}
 
 		reason := fmt.Sprintf("Instance creation failed for the following jobs: %s. "+
 			"Check the job logs to investigate the cause of the failure.",
-			strings.Join(failedJobs, ", "))
+			strings.Join(jobNames(failedJobs), ", "))
 
 		if err := r.RegisterPhase(ctx, cluster, apiv1.PhaseUnrecoverable, reason); err != nil {
 			return ctrl.Result{}, err
@@ -891,13 +898,40 @@ func (r *ClusterReconciler) reconcileResources(
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	runningJobs := resources.runningJobNames()
-
-	// Act on Pods and PVCs only if there is nothing that is currently being created or deleted
-
+	// Act on Pods and PVCs only if there is nothing currently being created or
+	// deleted. While Jobs are in flight, surface their health on the Provisioning
+	// condition before waiting; a stuck Job with an identified root cause also
+	// moves the cluster to the unschedulable phase.
 	if len(runningJobs) > 0 {
-		contextLogger.Debug("A job is currently running. Waiting", "runningJobs", runningJobs)
+		stuckRootCause, err := r.reconcileProvisioningCondition(ctx, cluster, runningJobs)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		if stuckRootCause != "" {
+			if err := r.RegisterPhase(ctx, cluster, apiv1.PhaseUnschedulable, stuckRootCause); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+
+		// The Job is progressing again: clear a stale unschedulable phase set by a
+		// previous reconcile so it does not linger until the Job completes.
+		if cluster.Status.Phase == apiv1.PhaseUnschedulable {
+			if err := r.RegisterPhase(ctx, cluster,
+				apiv1.PhaseWaitingForInstancesToBeActive, "Provisioning resumed"); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+
+		contextLogger.Debug("A job is currently running. Waiting",
+			"runningJobs", resources.runningJobNames())
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// No incomplete Jobs remain: clear any stale provisioning problem.
+	if err := r.clearProvisioningCondition(ctx, cluster); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	if result, err := r.deleteTerminatedPods(ctx, cluster, resources); err != nil {

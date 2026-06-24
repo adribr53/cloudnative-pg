@@ -55,6 +55,26 @@ func SetClusterReadyCondition(cluster *apiv1.Cluster) {
 	meta.SetStatusCondition(&cluster.Status.Conditions, condition)
 }
 
+// SetProvisioningCondition returns a transaction that sets the cluster's
+// Provisioning condition. Unlike PhaseReason, this condition is additive and
+// carries a machine-readable reason plus a lastTransitionTime maintained by
+// meta.SetStatusCondition, so it survives phase transitions and does not get
+// overwritten by unrelated reconcile steps.
+func SetProvisioningCondition(
+	status metav1.ConditionStatus,
+	reason apiv1.ConditionReason,
+	message string,
+) Transaction {
+	return func(cluster *apiv1.Cluster) {
+		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+			Type:    string(apiv1.ConditionProvisioning),
+			Status:  status,
+			Reason:  string(reason),
+			Message: message,
+		})
+	}
+}
+
 // SetPhase is a transaction that sets the cluster phase and reason
 func SetPhase(phase string, reason string) Transaction {
 	return func(cluster *apiv1.Cluster) {

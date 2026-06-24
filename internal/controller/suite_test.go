@@ -76,9 +76,23 @@ func buildTestEnvironment() *testingEnvironment {
 
 	scheme := schemeBuilder.BuildWithAllKnownScheme()
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
-		WithStatusSubresource(&apiv1.Cluster{}, &apiv1.Backup{}, &apiv1.Pooler{}, &corev1.Service{},
-			&corev1.ConfigMap{}, &corev1.Secret{}).
+		WithStatusSubresource(&apiv1.Cluster{}, &apiv1.Backup{}, &apiv1.Pooler{}, &batchv1.Job{},
+			&corev1.Service{}, &corev1.ConfigMap{}, &corev1.Secret{}).
 		WithIndex(&batchv1.Job{}, jobOwnerKey, jobOwnerIndexFunc).
+		WithIndex(&corev1.Pod{}, podOwnerKey, func(rawObj client.Object) []string {
+			pod := rawObj.(*corev1.Pod)
+			if ownerName, ok := IsOwnedByCluster(pod); ok {
+				return []string{ownerName}
+			}
+			return nil
+		}).
+		WithIndex(&corev1.PersistentVolumeClaim{}, pvcOwnerKey, func(rawObj client.Object) []string {
+			pvc := rawObj.(*corev1.PersistentVolumeClaim)
+			if ownerName, ok := IsOwnedByCluster(pvc); ok {
+				return []string{ownerName}
+			}
+			return nil
+		}).
 		WithIndex(&apiv1.Backup{}, ".spec.cluster.name", func(rawObj client.Object) []string {
 			return []string{rawObj.(*apiv1.Backup).Spec.Cluster.Name}
 		}).
