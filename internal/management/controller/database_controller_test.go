@@ -138,6 +138,9 @@ var _ = Describe("Managed Database status", func() {
 		Expect(database.Status.Applied).Should(HaveValue(BeTrue()))
 		Expect(database.GetStatusMessage()).Should(BeEmpty())
 		Expect(database.GetFinalizers()).NotTo(BeEmpty())
+		// the primary that applied the database is recorded, so a later
+		// primary change can re-trigger reconciliation
+		Expect(database.Status.AppliedOnPrimary).Should(Equal("cluster-example-1"))
 	})
 
 	It("database object inherits error after patching", func(ctx SpecContext) {
@@ -548,6 +551,52 @@ var _ = Describe("Managed Database status", func() {
 
 		Expect(database.Status.Applied).To(HaveValue(BeTrue()))
 		Expect(database.Status.Message).To(BeEmpty())
+	})
+
+	It("re-applies an already-applied database when the primary changed", func(ctx SpecContext) {
+		// A switchover or failover changes the primary without bumping the
+		// spec generation: the new primary must reconcile the database again
+		// even though Generation == ObservedGeneration and Applied is true.
+		database.Status.Applied = ptr.To(true)
+		database.Status.ObservedGeneration = database.Generation
+		database.Status.AppliedOnPrimary = "cluster-example-old"
+		Expect(fakeClient.Status().Update(ctx, database)).To(Succeed())
+		// the current primary "cluster-example-1" is this pod, but differs
+		// from the recorded AppliedOnPrimary
+
+		expectedValue := sqlmock.NewRows([]string{""}).AddRow("1")
+		dbMock.ExpectQuery(databaseDetectionQuery).WithArgs(database.Spec.Name).
+			WillReturnRows(expectedValue)
+		expectedQuery := fmt.Sprintf("ALTER DATABASE %s OWNER TO %s",
+			pgx.Identifier{database.Spec.Name}.Sanitize(),
+			pgx.Identifier{database.Spec.Owner}.Sanitize(),
+		)
+		dbMock.ExpectExec(expectedQuery).WillReturnResult(sqlmock.NewResult(0, 1))
+
+		err := reconcileDatabase(ctx, fakeClient, r, database)
+		Expect(err).ToNot(HaveOccurred())
+
+		Expect(database.Status.Applied).To(HaveValue(BeTrue()))
+		Expect(database.Status.Message).To(BeEmpty())
+		// the new primary is now recorded
+		Expect(database.Status.AppliedOnPrimary).To(Equal("cluster-example-1"))
+	})
+
+	It("keeps the fast path when the primary is unchanged", func(ctx SpecContext) {
+		// When the recorded primary still matches the current one, an
+		// already-applied database must not be reconciled again: no SQL is
+		// expected, so the AfterEach ExpectationsWereMet check would fail if
+		// the apply path ran.
+		database.Status.Applied = ptr.To(true)
+		database.Status.ObservedGeneration = database.Generation
+		database.Status.AppliedOnPrimary = "cluster-example-1"
+		Expect(fakeClient.Status().Update(ctx, database)).To(Succeed())
+
+		err := reconcileDatabase(ctx, fakeClient, r, database)
+		Expect(err).ToNot(HaveOccurred())
+
+		Expect(database.Status.Applied).To(HaveValue(BeTrue()))
+		Expect(database.Status.AppliedOnPrimary).To(Equal("cluster-example-1"))
 	})
 
 	It("retains the ownership of the managed database across a demotion", func(ctx SpecContext) {

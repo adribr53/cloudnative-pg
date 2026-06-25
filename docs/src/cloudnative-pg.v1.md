@@ -1078,6 +1078,7 @@ _Appears in:_
 | --- | --- | --- | --- | --- |
 | `observedGeneration` _integer_ | A sequence number representing the latest<br />desired state that was synchronized |  |  |  |
 | `applied` _boolean_ | Applied is true if the database was reconciled correctly |  |  |  |
+| `appliedOnPrimary` _string_ | AppliedOnPrimary is the name of the primary instance that last<br />successfully reconciled this database. When the cluster primary<br />changes (switchover or failover), it no longer matches the current<br />primary, signalling that the new primary must reconcile the database<br />again even though the spec generation hasn't changed. |  |  |  |
 | `message` _string_ | Message is the reconciliation output message |  |  |  |
 | `schemas` _[DatabaseObjectStatus](#databaseobjectstatus) array_ | Schemas is the status of the managed schemas |  |  |  |
 | `extensions` _[DatabaseObjectStatus](#databaseobjectstatus) array_ | Extensions is the status of the managed extensions |  |  |  |

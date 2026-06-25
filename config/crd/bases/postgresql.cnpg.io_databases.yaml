@@ -489,6 +489,14 @@ spec:
               applied:
                 description: Applied is true if the database was reconciled correctly
                 type: boolean
+              appliedOnPrimary:
+                description: |-
+                  AppliedOnPrimary is the name of the primary instance that last
+                  successfully reconciled this database. When the cluster primary
+                  changes (switchover or failover), it no longer matches the current
+                  primary, signalling that the new primary must reconcile the database
+                  again even though the spec generation hasn't changed.
+                type: string
               extensions:
                 description: Extensions is the status of the managed extensions
                 items:

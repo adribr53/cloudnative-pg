@@ -335,6 +335,14 @@ type DatabaseStatus struct {
 	// +optional
 	Applied *bool `json:"applied,omitempty"`
 
+	// AppliedOnPrimary is the name of the primary instance that last
+	// successfully reconciled this database. When the cluster primary
+	// changes (switchover or failover), it no longer matches the current
+	// primary, signalling that the new primary must reconcile the database
+	// again even though the spec generation hasn't changed.
+	// +optional
+	AppliedOnPrimary string `json:"appliedOnPrimary,omitempty"`
+
 	// Message is the reconciliation output message
 	// +optional
 	Message string `json:"message,omitempty"`

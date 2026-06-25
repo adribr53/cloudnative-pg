@@ -53,6 +53,16 @@ func (db *Database) GetStatusApplied() *bool {
 	return db.Status.Applied
 }
 
+// SetStatusAppliedOnPrimary records the primary that last reconciled the database
+func (db *Database) SetStatusAppliedOnPrimary(primary string) {
+	db.Status.AppliedOnPrimary = primary
+}
+
+// GetStatusAppliedOnPrimary returns the primary that last reconciled the database
+func (db *Database) GetStatusAppliedOnPrimary() string {
+	return db.Status.AppliedOnPrimary
+}
+
 // GetClusterRef returns the cluster reference of the database
 func (db *Database) GetClusterRef() corev1.LocalObjectReference {
 	return db.Spec.ClusterRef

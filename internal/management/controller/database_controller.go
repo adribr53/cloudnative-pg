@@ -142,8 +142,16 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, markAsFailed(ctx, r.Client, &database, fmt.Errorf("while fetching the cluster: %w", err))
 	}
 
+	// The fast path applies only when the current generation was already
+	// reconciled on the primary that is currently leading the cluster. A
+	// switchover or failover changes the primary without touching the spec
+	// generation, so the new primary must reconcile the database again even
+	// though Generation still equals ObservedGeneration.
+	reconciledOnCurrentPrimary := database.Generation == database.Status.ObservedGeneration &&
+		database.Status.AppliedOnPrimary == cluster.Status.CurrentPrimary
+
 	// If everything is reconciled, we're done here
-	if database.Generation == database.Status.ObservedGeneration {
+	if reconciledOnCurrentPrimary {
 		// ...unless the cluster moved in or out of the replica role after
 		// the database was applied: report the demotion on the status, and
 		// evaluate the database again after the promotion.
@@ -206,6 +214,10 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{RequeueAfter: databaseReconciliationInterval}, nil
 	}
 
+	// Record the primary that reconciled the database, so a later primary
+	// change (switchover or failover) re-triggers reconciliation even when
+	// the spec generation is unchanged.
+	database.SetStatusAppliedOnPrimary(cluster.Status.CurrentPrimary)
 	if err := markAsReady(ctx, r.Client, &database); err != nil {
 		return ctrl.Result{}, err
 	}
